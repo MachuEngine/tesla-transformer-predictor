@@ -105,10 +105,10 @@ class TimeSeriesTransformer(nn.Module):
 TimeSeriesTransformer 클래스는 nn.Module을 상속받아 정의된 클래스이다. 모델 구조는 이전과 달라진 부분은 없다. 
 """
 
-# 4. 모델 학습 함수 (멀티스텝 예측 및 Teacher Forcing 적용)
-def train_model(model, train_loader, device, epochs, learning_rate=0.001, teacher_forcing_ratio=0.5):
+# 4. 모델 학습 함수 (수정된 Loss Function 및 Teacher Forcing)
+def train_model(model, train_loader, device, epochs, learning_rate=0.0005, teacher_forcing_ratio=0.2):
     model.train()
-    criterion = nn.MSELoss()
+    criterion = nn.HuberLoss()  # Huber Loss로 변경
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = StepLR(optimizer, step_size=20, gamma=0.5)
     
@@ -118,32 +118,19 @@ def train_model(model, train_loader, device, epochs, learning_rate=0.001, teache
             src = src.to(device)   # [batch, seq_length, input_dim]
             tgt = tgt.to(device)   # [batch, pred_length, input_dim]
             
-            src = src.transpose(0, 1)  # [seq_length, batch, input_dim] <- Transformer 입력 형태로 reshape
-            batch_size = src.size(1) # decode 함수에서 사용하기 위해 batch_size 저장
-            input_dim = src.size(2) # decode 함수에서 사용하기 위해 input_dim 저장
-            pred_length = tgt.size(1) # decode 함수에서 사용하기 위해 pred_length 저장
+            src = src.transpose(0, 1)  # [seq_length, batch, input_dim]
+            batch_size = src.size(1)
+            input_dim = src.size(2)
+            pred_length = tgt.size(1)
             
-            # teacher forcing 적용 여부 결정
+            # Teacher Forcing 결정
             use_teacher_forcing = True if np.random.rand() < teacher_forcing_ratio else False
-            
             if use_teacher_forcing:
-                # 디코더 입력: 시작 토큰(0벡터) + 타겟 시퀀스의 앞쪽 토큰들
                 start_token = torch.zeros(1, batch_size, input_dim).to(device)
                 tgt_transposed = tgt.transpose(0, 1)  # [pred_length, batch, input_dim]
-                decoder_input = torch.cat([start_token, tgt_transposed[:-1]], dim=0)  # [pred_length + 1, batch, input_dim]
-
-                # Slicing tgt_transposed[:-1] is equivalent to removing the last element of tgt_transposed
-                # 슬라이싱 문법 [start:end]을 사용하면, 기본적으로 첫 번째 차원(시간 차원)이 조작됩니다.
-                # tgt_transposed : [pred_length, batch, input_dim]
-                # tgt_transposed[:-1] : [pred_length-1, batch, input_dim]
-
-                # decoder_input : start_token(0벡터) + tgt_transposed[:-1] = [pred_length, batch, input_dim]
-                # decoder_input : [1, batch, input_dim] + [pred_length-1, batch, input_dim] = [pred_length, batch, input_dim]
+                decoder_input = torch.cat([start_token, tgt_transposed[:-1]], dim=0)
             else:
-                # teacher forcing 없이 0벡터만 사용
                 decoder_input = torch.zeros(pred_length, batch_size, input_dim).to(device)
-
-                # decoder_input : [pred_length, batch, input_dim]
             
             optimizer.zero_grad()
             output = model(src, decoder_input)  # [pred_length, batch, input_dim]
@@ -156,15 +143,28 @@ def train_model(model, train_loader, device, epochs, learning_rate=0.001, teache
         current_lr = scheduler.get_last_lr()[0]
         print(f"Epoch {epoch+1}/{epochs}, Loss: {epoch_loss / len(train_loader):.6f}, LR: {current_lr:.6f}")
 
-"""
-train_model() 에서는 teacher forcing을 적용하여 모델을 학습하는 부분이 추가되었다.
+    """ 
+    디코더 입력: 시작 토큰(0벡터) + 타겟 시퀀스의 앞쪽 토큰들
+    start_token = torch.zeros(1, batch_size, input_dim).to(device)
+    tgt_transposed = tgt.transpose(0, 1)   [pred_length, batch, input_dim]
+    decoder_input = torch.cat([start_token, tgt_transposed[:-1]], dim=0)   [pred_length + 1, batch, input_dim]
 
-teacher forcing은 디코더의 입력을 타겟 시퀀스의 앞쪽 토큰들로 주는 방법이다.
-"""
+    Slicing tgt_transposed[:-1] is equivalent to removing the last element of tgt_transposed
+    슬라이싱 문법 [start:end]을 사용하면, 기본적으로 첫 번째 차원(시간 차원)이 조작됩니다.
+    tgt_transposed : [pred_length, batch, input_dim]
+    tgt_transposed[:-1] : [pred_length-1, batch, input_dim]
 
+    decoder_input : start_token(0벡터) + tgt_transposed[:-1] = [pred_length, batch, input_dim]
+    decoder_input : [1, batch, input_dim] + [pred_length-1, batch, input_dim] = [pred_length, batch, input_dim]
+    else:
+    teacher forcing 없이 0벡터만 사용
+    decoder_input = torch.zeros(pred_length, batch_size, input_dim).to(device)
 
-# 5. 미래 예측 (멀티스텝 Rollout 방식)
-def predict_future(model, test_data, seq_length, pred_length, total_predictions, device):
+    decoder_input : [pred_length, batch, input_dim]
+    """
+
+# 5. 미래 예측 (결과 Smoothing 추가)
+def predict_future(model, test_data, seq_length, pred_length, total_predictions, device, smooth_window=5):
     model.eval()
     test_input = torch.tensor(test_data[:seq_length], dtype=torch.float32).to(device)  # [seq_length, input_dim]
     predictions = []
@@ -177,7 +177,6 @@ def predict_future(model, test_data, seq_length, pred_length, total_predictions,
             out = model(src, decoder_input)    # [pred_length, 1, input_dim]
             out = out.squeeze(1)               # [pred_length, input_dim]
             predictions.append(out.cpu().numpy())
-            # 예측된 구간을 시퀀스에 추가하여 롤아웃 업데이트한다.
             test_input = torch.cat([test_input[pred_length:], out], dim=0)
         if remainder > 0:
             src = test_input.unsqueeze(1)
@@ -186,32 +185,24 @@ def predict_future(model, test_data, seq_length, pred_length, total_predictions,
             out = out.squeeze(1)
             predictions.append(out.cpu().numpy())
         predictions = np.concatenate(predictions, axis=0)
-    return predictions
+    
+    # Smoothing 예측 결과
+    smoothed_predictions = np.convolve(predictions[:, 0], np.ones(smooth_window)/smooth_window, mode='valid')
+    return predictions, smoothed_predictions
 
-"""
-1) test_input : test_data의 앞쪽 seq_length만큼을 입력으로 사용한다.
-2) steps : total_predictions을 pred_length로 나눈 몫을 저장한다.
-3) remainder : total_predictions을 pred_length로 나눈 나머지를 저장한다.
-4) for문에서 steps만큼 반복하면서 예측을 수행한다.
-    - src : test_input을 unsqueeze하여 차원을 추가한다. [seq_length, 1, input_dim]
-    - decoder_input : [pred_length, 1, input_dim] 형태의 0벡터를 생성한다.
-    - out : 모델에 src와 decoder_input을 입력하여 예측을 수행한다. [pred_length, 1, input_dim]
-    - out : squeeze를 통해 차원을 줄인다. [pred_length, input_dim]
-    - predictions : 예측 결과를 리스트에 추가한다.
-    - test_input : 예측된 구간을 시퀀스에 추가하여 롤아웃 업데이트한다.
-5) remainder가 0보다 크다면, 나머지에 대한 예측을 수행한다.
-6) 최종 예측 결과를 반환한다.
-"""
-
-# 6. 결과 시각화 함수 (Close price만)
-def plot_predictions(actual, predictions, seq_length):
+# 6. 시각화 함수 (RMSE 추가)
+def plot_predictions(actual, predictions, smoothed_predictions, seq_length):
+    from sklearn.metrics import mean_squared_error
+    rmse = np.sqrt(mean_squared_error(actual[seq_length:seq_length + len(predictions), 0], predictions[:, 0]))
     plt.figure(figsize=(12,6))
     plt.plot(actual[:, 0], label="Actual Close Price")
     plt.plot(range(seq_length, seq_length + len(predictions)), predictions[:, 0], 
              label="Predicted Close Price", linestyle="dashed")
+    plt.plot(range(seq_length, seq_length + len(smoothed_predictions)), smoothed_predictions, 
+             label="Smoothed Predictions", linestyle="dotted")
     plt.xlabel("Time Step")
     plt.ylabel("Price")
-    plt.title("Tesla Stock Price Prediction using Transformer")
+    plt.title(f"Tesla Stock Price Prediction using Transformer (RMSE: {rmse:.2f})")
     plt.legend()
     plt.show()
 
@@ -221,11 +212,11 @@ def main():
     ticker = "TSLA"
     start_date = "2015-01-01"
     end_date = "2025-02-05"
-    seq_length = 60       # 입력 시퀀스 길이
-    pred_length = 20      # 한 번에 예측할 미래 시점 개수 (멀티스텝 예측)
+    seq_length = 60
+    pred_length = 10
     batch_size = 32
-    epochs = 50
-    total_predictions = 200   # 예측할 총 미래 시점 개수
+    epochs = 100
+    total_predictions = 200
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # 데이터 로딩 및 전처리
@@ -235,22 +226,24 @@ def main():
         split_ratio=0.8
     )
     
-    # DataLoader 생성 (멀티스텝 예측)
+    # DataLoader 생성
     train_loader = create_dataloader(train_data, seq_length, pred_length, batch_size)
     
     # 모델 생성
-    model = TimeSeriesTransformer(input_dim=5, d_model=128, nhead=4, num_layers=3).to(device)
+    model = TimeSeriesTransformer(input_dim=5, d_model=256, nhead=4, num_layers=4).to(device)
     
-    # 모델 학습 (멀티스텝 및 Teacher Forcing 적용)
-    train_model(model, train_loader, device, epochs, learning_rate=0.001, teacher_forcing_ratio=0.5)
+    # 모델 학습
+    train_model(model, train_loader, device, epochs, learning_rate=0.0005, teacher_forcing_ratio=0.2)
     
-    # 미래 예측 (멀티스텝 Rollout)
-    predictions = predict_future(model, test_data, seq_length, pred_length, total_predictions, device)
+    # 미래 예측
+    predictions, smoothed_predictions = predict_future(
+        model, test_data, seq_length, pred_length, total_predictions, device, smooth_window=5
+    )
     predictions_inverse = scaler.inverse_transform(predictions)
     actual_test = scaler.inverse_transform(test_data)
     
-    # 결과 시각화 (Close price만)
-    plot_predictions(actual_test, predictions_inverse, seq_length)
+    # 결과 시각화
+    plot_predictions(actual_test, predictions_inverse, smoothed_predictions, seq_length)
 
 if __name__ == "__main__":
     main()
